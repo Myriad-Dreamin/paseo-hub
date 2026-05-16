@@ -10,4 +10,5 @@ dist
 .paseo
 .playwright-mcp
 *.log
+*.tsbuildinfo
 package-lock.json

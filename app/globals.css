@@ -1,0 +1,60 @@
+:root {
+  color-scheme: dark;
+  --bg: #101416;
+  --sidebar: #0d1215;
+  --chrome: #12171a;
+  --tabbar: #151a1e;
+  --panel: #151b20;
+  --panel-muted: #13191d;
+  --panel-soft: #1a2127;
+  --input: #10161a;
+  --code: #202529;
+  --selected: #101a24;
+  --line: #2a333a;
+  --line-soft: #1f272d;
+  --text: #f1f5f9;
+  --muted: #98a5b3;
+  --muted-strong: #7b8794;
+  --dim: #5f6b78;
+  --accent: #5899e8;
+  --danger: #e1606b;
+  --pending: #d1aa5c;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    Geist, Satoshi, "Segoe UI", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    sans-serif;
+  letter-spacing: 0;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+a {
+  color: inherit;
+}
+
+::selection {
+  background: rgba(74, 144, 226, 0.26);
+}

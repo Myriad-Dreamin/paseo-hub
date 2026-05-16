@@ -1,0 +1,13 @@
+node_modules
+.pnpm-store
+.next
+out
+build
+dist
+.env
+.env*
+!.env.example
+.paseo
+.playwright-mcp
+*.log
+package-lock.json

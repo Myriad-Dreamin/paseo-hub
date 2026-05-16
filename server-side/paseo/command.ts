@@ -20,6 +20,7 @@ export type RunMachineCommandOptions = {
   timeoutMs?: number;
   forwardProxyEnv?: boolean;
   useRemoteLoginShell?: boolean;
+  preview?: string;
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
 };
@@ -95,15 +96,15 @@ function quoteRemotePath(value: string) {
 }
 
 function prefixProxyEnv(command: string, env: NodeJS.ProcessEnv) {
-  const assignments = proxyEnvKeys
+  const exportStatements = proxyEnvKeys
     .filter((key) => env[key])
-    .map((key) => `${key}=${quotePosix(String(env[key]))}`);
+    .map((key) => `export ${key}=${quotePosix(String(env[key]))}`);
 
-  if (assignments.length === 0) {
+  if (exportStatements.length === 0) {
     return command;
   }
 
-  return `env ${assignments.join(" ")} ${command}`;
+  return `${exportStatements.join("; ")}; ${command}`;
 }
 
 function buildRemoteCommandBody(command: string, options: RunMachineCommandOptions) {
@@ -134,7 +135,7 @@ function wrapRemoteLoginShell(command: string, options: RunMachineCommandOptions
   }
 
   const quotedCommand = quotePosix(command);
-  return `[ -n "$SHELL" ] && [ -x "$SHELL" ] && exec "$SHELL" -lic ${quotedCommand} || exec /bin/sh -lc ${quotedCommand}`;
+  return `[ -n "$SHELL" ] && [ -x "$SHELL" ] && exec "$SHELL" -lc ${quotedCommand} || exec /bin/sh -lc ${quotedCommand}`;
 }
 
 function buildRemoteCommand(command: string, options: RunMachineCommandOptions) {
@@ -162,31 +163,12 @@ function killProcessTree(child: ChildProcess) {
   });
 }
 
-export function runMachineCommand(
-  machine: MachineTarget,
-  command: string,
+function collectChildProcessResult(
+  child: ChildProcess,
+  resultBase: Omit<RunMachineCommandResult, "stdout" | "stderr">,
   options: RunMachineCommandOptions = {}
 ): Promise<RunMachineCommandResult> {
   return new Promise((resolve, reject) => {
-    const mode = getMachineMode(machine);
-    const target = mode === "local" ? "localhost" : getSshTarget(machine);
-    const remoteCommand = mode === "local" ? command : buildRemoteCommand(command, options);
-    const preview = mode === "local" ? command : buildCommandPreview(machine, buildRemoteCommandBody(command, options));
-    const child =
-      mode === "local"
-        ? spawn(command, {
-            cwd: options.cwd,
-            env: options.env || process.env,
-            shell: true,
-            windowsHide: true
-          })
-        : spawn("ssh", [target, remoteCommand], {
-            cwd: options.cwd,
-            env: options.env || process.env,
-            shell: false,
-            windowsHide: true
-          });
-
     const stdout: string[] = [];
     const stderr: string[] = [];
     let settled = false;
@@ -199,13 +181,13 @@ export function runMachineCommand(
         }, options.timeoutMs)
       : null;
 
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       stdout.push(text);
       options.onStdout?.(text);
     });
 
-    child.stderr.on("data", (chunk: Buffer) => {
+    child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       stderr.push(text);
       options.onStderr?.(text);
@@ -224,12 +206,9 @@ export function runMachineCommand(
       if (timer) clearTimeout(timer);
 
       const result: RunMachineCommandResult = {
+        ...resultBase,
         stdout: stdout.join(""),
-        stderr: stderr.join(""),
-        command,
-        preview,
-        mode,
-        target
+        stderr: stderr.join("")
       };
 
       if (code === 0 && !timedOut) {
@@ -238,10 +217,78 @@ export function runMachineCommand(
       }
 
       const error = new Error(
-        timedOut ? `${preview} timed out` : `${preview} failed with exit code ${code ?? "unknown"}`
+        timedOut ? `${result.preview} timed out` : `${result.preview} failed with exit code ${code ?? "unknown"}`
       ) as Error & RunMachineCommandResult;
       Object.assign(error, result);
       reject(error);
     });
   });
+}
+
+function previewCommand(command: string, args: string[]) {
+  return [command, ...args]
+    .map((part) => (/[\s"]/u.test(part) ? `"${part.replace(/"/g, '\\"')}"` : part))
+    .join(" ");
+}
+
+export function runLocalExecutableCommand(
+  command: string,
+  args: string[],
+  options: RunMachineCommandOptions = {}
+): Promise<RunMachineCommandResult> {
+  const preview = options.preview || previewCommand(command, args);
+  const child = spawn(command, args, {
+    cwd: options.cwd,
+    env: options.env || process.env,
+    shell: false,
+    windowsHide: true
+  });
+
+  return collectChildProcessResult(
+    child,
+    {
+      command: preview,
+      preview,
+      mode: "local",
+      target: "localhost"
+    },
+    options
+  );
+}
+
+export function runMachineCommand(
+  machine: MachineTarget,
+  command: string,
+  options: RunMachineCommandOptions = {}
+): Promise<RunMachineCommandResult> {
+  const mode = getMachineMode(machine);
+  const target = mode === "local" ? "localhost" : getSshTarget(machine);
+  const remoteCommand = mode === "local" ? command : buildRemoteCommand(command, options);
+  const preview =
+    options.preview || (mode === "local" ? command : buildCommandPreview(machine, buildRemoteCommandBody(command, options)));
+  const child =
+    mode === "local"
+      ? spawn(command, {
+          cwd: options.cwd,
+          env: options.env || process.env,
+          shell: true,
+          windowsHide: true
+        })
+      : spawn("ssh", [target, remoteCommand], {
+          cwd: options.cwd,
+          env: options.env || process.env,
+          shell: false,
+          windowsHide: true
+        });
+
+  return collectChildProcessResult(
+    child,
+    {
+      command,
+      preview,
+      mode,
+      target
+    },
+    options
+  );
 }

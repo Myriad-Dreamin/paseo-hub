@@ -36,11 +36,22 @@ type ConfigResponse = {
   configPath: string;
 };
 
-type InstallResponse = {
-  message?: string;
-  output?: string;
-  error?: string;
-};
+type InstallStreamEvent =
+  | {
+      type: "stdout" | "stderr";
+      data: string;
+    }
+  | {
+      type: "exit";
+      ok: boolean;
+      code: number | null;
+      signal: string | null;
+      message: string;
+    }
+  | {
+      type: "error";
+      message: string;
+    };
 
 type DaemonStatus = {
   state: DaemonState;
@@ -265,21 +276,19 @@ export default function Home() {
     return config.machines.find((machine) => machine.id === activeMachineId) || config.machines[0] || fallbackMachine;
   }, [activeMachineId, config.machines]);
 
-  const command = useMemo(() => {
+  const command = "pnpm install:paseo";
+
+  const sourceFlow = useMemo(() => {
     if (config.paseo.source === "github") {
-      return `pnpm add github:${config.paseo.repository}#${config.paseo.ref}`;
+      return `git clone ${config.paseo.repository}#${config.paseo.ref} -> pnpm install daemon workspaces -> pnpm build daemon -> link`;
     }
 
-    return `pnpm add ${config.paseo.packageName}`;
+    return `pnpm add ${config.paseo.packageName} -> link`;
   }, [config.paseo]);
 
   const commandPreview = useMemo(() => {
-    if (isLocalMachine(activeMachine)) {
-      return command;
-    }
-
-    return `ssh ${activeMachine.sshHost || activeMachine.host} "${command}"`;
-  }, [activeMachine, command]);
+    return command;
+  }, []);
 
   const sourceLabel = useMemo(() => {
     if (config.paseo.source === "github") {
@@ -441,9 +450,57 @@ export default function Home() {
   }
 
   async function installPaseo(machine = activeMachine) {
+    const initialOutput = `# running ${scriptPath}\n# target ${commandTarget(machine)}\n`;
+    let receivedOutput = initialOutput;
+    let finalOk = false;
+    let finalMessage = "";
+    let failureMessage = "";
+
+    function appendOutput(chunk: string) {
+      receivedOutput += chunk;
+      setOutput((current) => `${current}${chunk}`);
+    }
+
+    function handleInstallEvent(event: InstallStreamEvent) {
+      if (event.type === "stdout" || event.type === "stderr") {
+        appendOutput(event.data);
+        return;
+      }
+
+      if (event.type === "error") {
+        failureMessage = event.message;
+        if (!receivedOutput.includes(event.message)) {
+          appendOutput(`${receivedOutput.endsWith("\n") ? "" : "\n"}# ${event.message}\n`);
+        }
+        return;
+      }
+
+      if (event.type !== "exit") return;
+
+      finalOk = event.ok;
+      finalMessage = event.message;
+
+      if (!event.ok) {
+        failureMessage = event.message;
+        if (!receivedOutput.includes(event.message)) {
+          appendOutput(`${receivedOutput.endsWith("\n") ? "" : "\n"}# ${event.message}\n`);
+        }
+      }
+    }
+
+    function handleInstallLine(line: string) {
+      if (!line.trim()) return;
+
+      try {
+        handleInstallEvent(JSON.parse(line) as InstallStreamEvent);
+      } catch {
+        appendOutput(`${line}\n`);
+      }
+    }
+
     setStatus("running");
     setMessage(`running ${scriptPath}`);
-    setOutput("");
+    setOutput(initialOutput);
     setActiveMachineId(machine.id);
     setMainView("machine");
 
@@ -453,11 +510,43 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ machine })
       });
-      const data = (await response.json()) as InstallResponse;
 
-      if (!response.ok) {
-        setOutput(data.output || "");
-        throw new Error(data.error || "Install request failed");
+      if (!response.body) {
+        const text = await response.text();
+        if (text) {
+          appendOutput(text);
+        }
+
+        if (!response.ok) {
+          throw new Error(text || "Install request failed");
+        }
+
+        finalOk = true;
+        finalMessage = `${scriptPath} passed`;
+      } else {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+
+          if (value) {
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+            lines.forEach(handleInstallLine);
+          }
+
+          if (done) break;
+        }
+
+        buffer += decoder.decode();
+        handleInstallLine(buffer);
+      }
+
+      if (!finalOk) {
+        throw new Error(failureMessage || finalMessage || "Install request failed");
       }
 
       const installedMachine = { ...machine, paseoInstalled: true };
@@ -469,13 +558,20 @@ export default function Home() {
       };
 
       setStatus("success");
-      setMessage(data.message || `${scriptPath} passed`);
-      setOutput(data.output || "# passed");
+      setMessage(finalMessage || `${scriptPath} passed`);
       await saveConfig(nextConfig);
       void refreshDaemonStatus(installedMachine);
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Install request failed";
+
       setStatus("error");
-      setMessage(error instanceof Error ? error.message : "Install request failed");
+      setMessage(errorMessage);
+
+      if (!receivedOutput.includes("# failed")) {
+        appendOutput(`${receivedOutput.endsWith("\n") ? "" : "\n"}# failed\n${errorMessage}\n`);
+      } else if (!receivedOutput.includes(errorMessage)) {
+        appendOutput(`${receivedOutput.endsWith("\n") ? "" : "\n"}${errorMessage}\n`);
+      }
     }
   }
 
@@ -610,7 +706,7 @@ export default function Home() {
 
   const terminalOutput = useMemo(() => {
     if (status === "running") {
-      return `${commandPreview}\n# running ${scriptPath}\n# target ${commandTarget(activeMachine)}`;
+      return `${commandPreview}\n${output || `# running ${scriptPath}\n# target ${commandTarget(activeMachine)}`}`;
     }
 
     if (status === "success" && output) {
@@ -618,7 +714,11 @@ export default function Home() {
     }
 
     if (status === "error") {
-      return `${commandPreview}\n# failed\n${message}${output ? `\n${output}` : ""}`;
+      const extraMessage = message && !output.includes(message)
+        ? `${output.endsWith("\n") ? "" : "\n"}# failed\n${message}`
+        : "";
+
+      return `${commandPreview}\n${output}${extraMessage}`;
     }
 
     return `${commandPreview}\n# waiting\n# target ${commandTarget(activeMachine)}`;
@@ -901,9 +1001,9 @@ export default function Home() {
                   </select>
                 </div>
                 <div className={styles.configItem}>
-                  <span>package</span>
+                  <span>flow</span>
                   <strong>{sourceLabel}</strong>
-                  <code>{command}</code>
+                  <code>{sourceFlow}</code>
                 </div>
                 <div className={styles.configItem}>
                   <span>config</span>

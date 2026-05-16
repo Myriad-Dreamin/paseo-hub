@@ -2,6 +2,7 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   isLocalMachine,
+  runLocalExecutableCommand,
   runMachineCommand,
   type MachineTarget,
   type RunMachineCommandOptions,
@@ -50,7 +51,19 @@ const machine: Machine = {
 const proxy = resolveProxyEnv(process.env);
 const commandEnv = proxy.env;
 const commandTimeoutMs = Number(process.env.PASEO_INSTALL_COMMAND_TIMEOUT_MS || 1800000);
-const buildCommand = "pnpm build";
+const daemonWorkspaceFilters = [
+  "@getpaseo/highlight",
+  "@getpaseo/relay",
+  "@getpaseo/server",
+  "@getpaseo/cli"
+];
+const daemonFilterArgs = daemonWorkspaceFilters.map((name) => `--filter ${name}`).join(" ");
+const buildCommand = [
+  "pnpm --filter @getpaseo/highlight build",
+  "pnpm --filter @getpaseo/relay build",
+  "pnpm --filter @getpaseo/server build",
+  "pnpm --filter @getpaseo/cli build"
+].join(" && ");
 const transcript: string[] = [];
 
 function record(stream: NodeJS.WriteStream, text: string) {
@@ -93,6 +106,40 @@ function quoteRemotePath(value: string) {
 
   return quotePosix(value);
 }
+
+function isLoopbackProxyUrl(value: string | undefined) {
+  if (!value) {
+    return false;
+  }
+
+  try {
+    const { hostname } = new URL(value);
+    const normalized = hostname.toLowerCase();
+    return normalized === "localhost" || normalized.startsWith("127.") || normalized === "::1" || normalized === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+function shouldForwardProxyEnvToMachine() {
+  if (isLocalMachine(machine) || proxy.source !== "windows-system") {
+    return true;
+  }
+
+  return ![
+    commandEnv.HTTP_PROXY,
+    commandEnv.HTTPS_PROXY,
+    commandEnv.ALL_PROXY,
+    commandEnv.http_proxy,
+    commandEnv.https_proxy,
+    commandEnv.all_proxy
+  ].some(isLoopbackProxyUrl);
+}
+
+const forwardProxyEnvToMachine = shouldForwardProxyEnvToMachine();
+const proxyForwardingSummary = forwardProxyEnvToMachine
+  ? "enabled"
+  : "disabled for ssh: Windows system proxy resolves to local loopback";
 
 function remoteDirname(value: string) {
   const index = value.lastIndexOf("/");
@@ -162,7 +209,7 @@ async function runStep(
       remoteCwd: options.remoteCwd,
       env: commandEnv,
       timeoutMs: options.timeoutMs || commandTimeoutMs,
-      forwardProxyEnv: options.forwardProxyEnv,
+      forwardProxyEnv: options.forwardProxyEnv ?? forwardProxyEnvToMachine,
       onStdout: (chunk) => {
         lastOutputAt = Date.now();
         record(process.stdout, chunk);
@@ -341,6 +388,30 @@ async function prepareNpmWorkspace() {
   return isLocalMachine(machine) ? prepareLocalNpmWorkspace() : prepareRemoteNpmWorkspace();
 }
 
+async function ensureRemotePrerequisites() {
+  if (isLocalMachine(machine)) {
+    return;
+  }
+
+  const requiredCommands = config.paseo.source === "github" ? ["git", "node", "pnpm"] : ["node", "pnpm"];
+  const checks = requiredCommands.map(
+    (command) => `command -v ${command} >/dev/null 2>&1 || missing="$missing ${command}"`
+  );
+  const versions = requiredCommands.map((command) => `${command} --version`);
+  const command = [
+    'missing=""',
+    ...checks,
+    'if [ -n "$missing" ]; then echo "missing remote command(s):$missing" >&2; echo "Install Node.js and pnpm on the remote machine, or make them available in the non-interactive SSH PATH." >&2; exit 127; fi',
+    ...versions
+  ].join("; ");
+
+  await runStep("check remote toolchain", command, {
+    cwd: root,
+    timeoutMs: 30000,
+    forwardProxyEnv: false
+  });
+}
+
 async function linkLocalPaseoCli(workspace: string) {
   const wrapperPath = path.join(binDir, process.platform === "win32" ? "paseo.cmd" : "paseo");
 
@@ -418,16 +489,53 @@ async function linkPaseoCli(workspace: string): Promise<LinkedCli> {
   return linkRemotePaseoCli(workspace);
 }
 
-async function checkDaemonStatus(linkedCli: LinkedCli) {
-  const command = isLocalMachine(machine)
-    ? `${quoteLocalArg(linkedCli.path)} daemon status`
-    : `${quoteRemotePath(linkedCli.path)} daemon status`;
+async function checkDaemonStatus(linkedCli: LinkedCli, workspace: string) {
+  const localCliEntry =
+    isLocalMachine(machine) && config.paseo.source === "github"
+      ? path.join(workspace, "packages", "cli", "bin", "paseo")
+      : "";
+  const useLocalCliEntry = Boolean(localCliEntry && (await exists(localCliEntry)));
+  const command =
+    useLocalCliEntry
+      ? `${quoteLocalArg(localCliEntry)} daemon status`
+      : isLocalMachine(machine)
+        ? `${quoteLocalArg(linkedCli.path)} daemon status`
+        : `${quoteRemotePath(linkedCli.path)} daemon status`;
 
-  return tryStep("check daemon status", command, {
-    cwd: root,
-    timeoutMs: 30000,
-    forwardProxyEnv: false
-  });
+  logLine();
+  logLine("## check daemon status");
+  logLine(`$ ${command}`);
+
+  try {
+    const runOptions = {
+      cwd: useLocalCliEntry ? workspace : root,
+      env: commandEnv,
+      timeoutMs: 10000,
+      forwardProxyEnv: false,
+      preview: command,
+      onStdout: (chunk: string) => record(process.stdout, chunk),
+      onStderr: (chunk: string) => record(process.stderr, chunk)
+    };
+    const result = useLocalCliEntry
+      ? await runLocalExecutableCommand(
+          process.execPath,
+          ["--disable-warning=DEP0040", localCliEntry, "daemon", "status"],
+          runOptions
+        )
+      : await runMachineCommand(machine, command, runOptions);
+
+    logLine();
+    logLine("# check daemon status passed");
+    return {
+      result,
+      error: null
+    };
+  } catch (error) {
+    return {
+      result: null,
+      error
+    };
+  }
 }
 
 async function writeTranscriptLog(extraLines: string[] = []) {
@@ -447,7 +555,7 @@ async function main() {
   const target = isLocalMachine(machine) ? "localhost" : machine.sshHost || machine.host;
   const installCommand =
     config.paseo.source === "github"
-      ? "pnpm install --link-workspace-packages=true"
+      ? `pnpm install ${daemonFilterArgs} --link-workspace-packages=true`
       : `pnpm add ${config.paseo.packageName}`;
 
   logLine("paseo install");
@@ -456,6 +564,7 @@ async function main() {
   logLine(`source: ${config.paseo.source}`);
   logLine(`proxy: ${proxy.source}`);
   logLine(`proxy-summary: ${proxy.summary}`);
+  logLine(`proxy-forwarding: ${proxyForwardingSummary}`);
   logLine(`install-command: ${installCommand}`);
   logLine(`build-command: ${config.paseo.source === "github" ? buildCommand : "skipped for npm package source"}`);
   if (config.paseo.source === "github") {
@@ -469,6 +578,8 @@ async function main() {
   logLine(isLocalMachine(machine) ? "connection: local" : `ssh-target: ${target}`);
   logLine(machine.daemonForwardPort ? `daemon-forward-port: ${machine.daemonForwardPort}` : "daemon-forward-port: off");
   logLine(`timeout-ms: ${commandTimeoutMs}`);
+
+  await ensureRemotePrerequisites();
 
   const sourceWorkspace =
     config.paseo.source === "github" ? await prepareGithubSource() : await prepareNpmWorkspace();
@@ -486,7 +597,7 @@ async function main() {
 
   const buildResult =
     config.paseo.source === "github"
-      ? await runStep("build Paseo", buildCommand, {
+      ? await runStep("build Paseo daemon", buildCommand, {
           cwd: isLocalMachine(machine) ? sourceWorkspace : root,
           remoteCwd: isLocalMachine(machine) ? undefined : sourceWorkspace
         })
@@ -503,7 +614,7 @@ async function main() {
     logLine(linkedCli.output);
   }
 
-  const daemonCheck = await checkDaemonStatus(linkedCli);
+  const daemonCheck = await checkDaemonStatus(linkedCli, sourceWorkspace);
   const daemonResult = daemonCheck.result
     ? [daemonCheck.result.stdout.trim(), daemonCheck.result.stderr.trim()].filter(Boolean).join("\n")
     : commandErrorDetails(daemonCheck.error);
@@ -521,7 +632,8 @@ async function main() {
     configPath,
     proxy: {
       source: proxy.source,
-      summary: proxy.summary
+      summary: proxy.summary,
+      forwarding: proxyForwardingSummary
     },
     machine,
     commandMode: isLocalMachine(machine) ? "local" : "ssh",

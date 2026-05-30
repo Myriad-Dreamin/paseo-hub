@@ -34,6 +34,8 @@ pnpm service:start
 pnpm service:status
 ```
 
+`pnpm service:install` configures the service to run as the current Windows user by default. To use a different administrator account, run `pnpm service:install -- -PromptServiceAccount` from an elevated PowerShell session and enter that account when prompted. To intentionally run as the built-in system account, use `pnpm service:install -- -RunAsLocalSystem`.
+
 ## Configuration
 
 Paseo Hub reads its local settings from `paseo-hub/config.json` in the user config directory.

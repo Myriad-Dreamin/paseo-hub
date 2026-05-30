@@ -1,16 +1,20 @@
 param(
   [Parameter(Position = 0)]
-  [ValidateSet("install", "uninstall", "start", "stop", "restart", "status")]
+  [ValidateSet("install", "configure-user", "uninstall", "start", "stop", "restart", "status")]
   [string]$Action = "install",
 
   [string]$ServiceName = "PaseoHub",
   [string]$DisplayName = "Paseo Hub",
   [string]$Description = "Runs the local Paseo Hub workspace.",
   [string]$Hostname = "127.0.0.1",
-  [int]$Port = 3000,
+  [int]$Port = 14710,
+  [string]$ServiceAccount = "",
   [string]$WinSwVersion = "v2.12.0",
   [string]$WinSwUrl = "",
   [string]$PaseoHubConfigDir = "",
+  [switch]$RunAsCurrentUser,
+  [switch]$RunAsLocalSystem,
+  [switch]$PromptServiceAccount,
   [switch]$DelayedAutoStart,
   [switch]$SkipBuild,
   [switch]$NoStart
@@ -56,8 +60,8 @@ function Escape-Xml([string]$Value) {
   return [System.Security.SecurityElement]::Escape($Value)
 }
 
-function Invoke-Checked([scriptblock]$Command, [string]$Label) {
-  & $Command
+function Invoke-Checked([scriptblock]$ScriptBlock, [string]$Label) {
+  & $ScriptBlock
 
   if ($LASTEXITCODE -ne 0) {
     throw "$Label failed with exit code $LASTEXITCODE."
@@ -66,6 +70,11 @@ function Invoke-Checked([scriptblock]$Command, [string]$Label) {
 
 function Get-ServiceOrNull([string]$Name) {
   return Get-Service -Name $Name -ErrorAction SilentlyContinue
+}
+
+function Get-ServiceCimOrNull([string]$Name) {
+  $escapedName = $Name.Replace("'", "''")
+  return Get-CimInstance Win32_Service -Filter "Name='$escapedName'" -ErrorAction SilentlyContinue
 }
 
 function Get-WrapperDirectory([string]$RepoRoot) {
@@ -87,6 +96,166 @@ function Get-DefaultWinSwUrl {
 
   $arch = if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
   return "https://github.com/winsw/winsw/releases/download/$Version/WinSW-$arch.exe"
+}
+
+function Resolve-ServiceAccount {
+  $modes = @($RunAsCurrentUser, $RunAsLocalSystem, $PromptServiceAccount, [bool]$ServiceAccount) | Where-Object { $_ }
+
+  if ($modes.Count -gt 1) {
+    throw "Use only one service account option: -RunAsCurrentUser, -RunAsLocalSystem, -PromptServiceAccount, or -ServiceAccount."
+  }
+
+  if ($RunAsLocalSystem) {
+    return "LocalSystem"
+  }
+
+  if ($PromptServiceAccount) {
+    return "__PROMPT__"
+  }
+
+  if ($RunAsCurrentUser -or -not $ServiceAccount) {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  }
+
+  return $ServiceAccount
+}
+
+function Normalize-BuiltInServiceAccount([string]$Account) {
+  $normalized = $Account.Trim().ToLowerInvariant()
+
+  switch ($normalized) {
+    "localsystem" { return "LocalSystem" }
+    "local system" { return "LocalSystem" }
+    "nt authority\system" { return "LocalSystem" }
+    "system" { return "LocalSystem" }
+    "localservice" { return "NT AUTHORITY\LocalService" }
+    "local service" { return "NT AUTHORITY\LocalService" }
+    "nt authority\localservice" { return "NT AUTHORITY\LocalService" }
+    "networkservice" { return "NT AUTHORITY\NetworkService" }
+    "network service" { return "NT AUTHORITY\NetworkService" }
+    "nt authority\networkservice" { return "NT AUTHORITY\NetworkService" }
+    default { return "" }
+  }
+}
+
+function Convert-SecureStringToPlainText([Security.SecureString]$SecureString) {
+  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+
+  try {
+    return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+  } finally {
+    if ($bstr -ne [IntPtr]::Zero) {
+      [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+  }
+}
+
+function Read-ServiceCredential {
+  param(
+    [string]$UserName = "",
+    [string]$Message
+  )
+
+  try {
+    Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+
+    if ($UserName) {
+      $credential = Get-Credential -UserName $UserName -Message $Message -ErrorAction Stop
+    } else {
+      $credential = Get-Credential -Message $Message -ErrorAction Stop
+    }
+
+    return @{
+      UserName = $credential.UserName
+      Password = $credential.GetNetworkCredential().Password
+    }
+  } catch {
+    Write-Warning "Get-Credential is unavailable in this PowerShell session; falling back to console password input."
+  }
+
+  $resolvedUserName = $UserName
+
+  if ([string]::IsNullOrWhiteSpace($resolvedUserName)) {
+    $resolvedUserName = Read-Host "Windows account"
+  } else {
+    Write-Host "Windows account: $resolvedUserName"
+  }
+
+  if ([string]::IsNullOrWhiteSpace($resolvedUserName)) {
+    throw "Service account user name is required."
+  }
+
+  $securePassword = Read-Host "Password for $resolvedUserName" -AsSecureString
+
+  return @{
+    UserName = $resolvedUserName
+    Password = Convert-SecureStringToPlainText $securePassword
+  }
+}
+
+function Set-ServiceLogonAccount {
+  param(
+    [string]$Name,
+    [string]$Account
+  )
+
+  if (-not $Account) {
+    return
+  }
+
+  $service = Get-ServiceCimOrNull $Name
+
+  if (-not $service) {
+    throw "Service $Name is not installed."
+  }
+
+  if ($Account -eq "__PROMPT__") {
+    Write-Host "Configuring service $Name to run as a specified Windows account."
+    $credential = Read-ServiceCredential -Message "Enter the Windows account to run Paseo Hub. Use an administrator account only when you intentionally want the service to run with admin privileges."
+    $username = $credential.UserName
+    $password = $credential.Password
+  } else {
+    $builtInAccount = Normalize-BuiltInServiceAccount $Account
+
+    if ($builtInAccount) {
+      Write-Host "Configuring service $Name to run as $builtInAccount."
+      $result = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{
+        StartName = $builtInAccount
+        StartPassword = $null
+      }
+
+      if ($result.ReturnValue -ne 0) {
+        throw "Failed to configure service account for $Name. Win32_Service.Change returned $($result.ReturnValue)."
+      }
+
+      Write-Host "Configured service $Name to run as $builtInAccount."
+      return
+    }
+
+    Write-Host "Configuring service $Name to run as $Account."
+    $credential = Read-ServiceCredential -UserName $Account -Message "Enter the Windows password for $Account. It is used only to configure the Paseo Hub service logon account."
+    $username = $credential.UserName
+    $password = $credential.Password
+  }
+
+  if ([string]::IsNullOrWhiteSpace($username)) {
+    throw "Service account user name is required."
+  }
+
+  if ([string]::IsNullOrEmpty($password)) {
+    throw "A password is required when configuring a Windows service to run as $username."
+  }
+
+  $result = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{
+    StartName = $username
+    StartPassword = $password
+  }
+
+  if ($result.ReturnValue -ne 0) {
+    throw "Failed to configure service account for $Name. Win32_Service.Change returned $($result.ReturnValue)."
+  }
+
+  Write-Host "Configured service $Name to run as $username."
 }
 
 function Invoke-WebDownload {
@@ -248,6 +417,7 @@ function Install-Service {
   $startupMode = if ($DelayedAutoStart) { "delayed-auto" } else { "auto" }
   Invoke-Checked { & sc.exe config $ServiceName start= $startupMode } "sc config"
   Invoke-Checked { & sc.exe description $ServiceName $Description } "sc description"
+  Set-ServiceLogonAccount -Name $ServiceName -Account (Resolve-ServiceAccount)
 
   if ($NoStart) {
     Write-Host "Service installed and configured for automatic startup. Start skipped."
@@ -257,6 +427,39 @@ function Install-Service {
   $service = Get-ServiceOrNull $ServiceName
 
   if ($service -and $service.Status -eq "Running") {
+    Invoke-Wrapper -WrapperExe $wrapperExe -Command "restart"
+  } else {
+    Invoke-Wrapper -WrapperExe $wrapperExe -Command "start"
+  }
+
+  Show-ServiceStatus
+}
+
+function Configure-ServiceUser {
+  $repoRoot = Resolve-RepoRoot
+  $wrapperDir = Get-WrapperDirectory $repoRoot
+  $wrapperExe = Get-WrapperExecutable $wrapperDir
+  $wrapperConfig = Get-WrapperConfig $wrapperDir
+  $service = Get-ServiceOrNull $ServiceName
+
+  if (-not $service) {
+    throw "Service $ServiceName is not installed. Run service:install from an elevated PowerShell session first."
+  }
+
+  if (-not (Test-Path $wrapperExe)) {
+    throw "Service wrapper was not found at $wrapperExe. Run service:install from an elevated PowerShell session first."
+  }
+
+  Write-ServiceConfig -RepoRoot $repoRoot -WrapperDir $wrapperDir -WrapperConfig $wrapperConfig
+  Set-ServiceLogonAccount -Name $ServiceName -Account (Resolve-ServiceAccount)
+
+  if ($NoStart) {
+    Write-Host "Service account configured. Start skipped."
+    Show-ServiceStatus
+    return
+  }
+
+  if ($service.Status -eq "Running") {
     Invoke-Wrapper -WrapperExe $wrapperExe -Command "restart"
   } else {
     Invoke-Wrapper -WrapperExe $wrapperExe -Command "start"
@@ -316,11 +519,13 @@ function Show-ServiceStatus {
   $serviceInfo = Get-CimInstance Win32_Service -Filter "Name='$escapedName'" -ErrorAction SilentlyContinue
   $startMode = if ($serviceInfo) { $serviceInfo.StartMode } else { "unknown" }
   $pathName = if ($serviceInfo) { $serviceInfo.PathName } else { "" }
+  $startName = if ($serviceInfo) { $serviceInfo.StartName } else { "unknown" }
 
   Write-Host "Service: $ServiceName"
   Write-Host "Display: $($service.DisplayName)"
   Write-Host "Status:  $($service.Status)"
   Write-Host "Startup: $startMode"
+  Write-Host "Account: $startName"
 
   if ($pathName) {
     Write-Host "Binary:  $pathName"
@@ -335,6 +540,10 @@ switch ($Action) {
   "install" {
     Assert-Administrator
     Install-Service
+  }
+  "configure-user" {
+    Assert-Administrator
+    Configure-ServiceUser
   }
   "uninstall" {
     Assert-Administrator

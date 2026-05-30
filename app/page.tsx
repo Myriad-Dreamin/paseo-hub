@@ -8,6 +8,7 @@ type PaseoSource = "npm" | "github";
 type MainView = "dashboard" | "machine";
 type MachineKind = "local" | "ssh";
 type DaemonState = "unknown" | "checking" | "running" | "stopped" | "missing" | "error";
+type ForwardState = "off" | "starting" | "running" | "retrying" | "stopped" | "error";
 
 type Machine = {
   id: string;
@@ -60,6 +61,22 @@ type DaemonStatus = {
   ok?: boolean;
 };
 
+type SshForwardStatus = {
+  state: ForwardState;
+  command: string;
+  output: string;
+  ok: boolean;
+  localPort: number | null;
+  remotePort: number | null;
+  target: string;
+  pid?: number;
+  startedAt?: string;
+  managed?: "hub" | "external" | "none";
+  retryAttempt?: number;
+  retryDelayMs?: number | null;
+  nextRetryAt?: string;
+};
+
 type SshHost = {
   alias: string;
   hostName: string;
@@ -90,6 +107,11 @@ type MachineDraft = {
   paseoInstalled: boolean;
 };
 
+type ForwardDraft = {
+  enabled: boolean;
+  localPort: string;
+};
+
 const fallbackMachine: Machine = {
   id: "localhost",
   name: "localhost",
@@ -118,6 +140,11 @@ const emptyDraft: MachineDraft = {
   forwardDaemon: false,
   daemonForwardPort: "",
   paseoInstalled: false
+};
+
+const emptyForwardDraft: ForwardDraft = {
+  enabled: false,
+  localPort: ""
 };
 
 const scriptPath = "server-side/paseo/install.ts";
@@ -186,6 +213,33 @@ function isLocalMachine(machine: Machine) {
   return machine.kind === "local" || machine.id === "localhost" || machine.name === "localhost";
 }
 
+function parseForwardLocalPort(forward: string) {
+  if (!forward.trim()) {
+    return null;
+  }
+
+  const readableMatch = forward.match(/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*(\d+)/iu);
+  const arrowMatch = forward.match(/:(\d+)\s*->/u);
+  const sshDashLMatch = forward.match(/(?:^|\s)(\d+):[^:\s]+:\d+(?:\s|$)/u);
+  const parsed = Number(readableMatch?.[1] || arrowMatch?.[1] || sshDashLMatch?.[1]);
+
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : null;
+}
+
+function getForwardPort(machine: Pick<Machine, "daemonForwardPort" | "forward">) {
+  return typeof machine.daemonForwardPort === "number" &&
+    Number.isInteger(machine.daemonForwardPort) &&
+    machine.daemonForwardPort > 0 &&
+    machine.daemonForwardPort <= 65535
+    ? machine.daemonForwardPort
+    : parseForwardLocalPort(machine.forward || "");
+}
+
+function buildMachineForward(machine: Pick<Machine, "sshHost" | "host">, localPort: number) {
+  const target = machine.sshHost || machine.host;
+  return `localhost:${localPort}->${target}:6767`;
+}
+
 function normalizeMachine(machine: Partial<Machine>): Machine {
   const id = machine.id || createMachineId(machine.name || "machine");
   const local =
@@ -193,15 +247,23 @@ function normalizeMachine(machine: Partial<Machine>): Machine {
     id === "localhost" ||
     machine.name === "localhost" ||
     (!machine.sshHost && (machine.host === "localhost" || machine.host === "127.0.0.1"));
+  const sshHost = local ? "" : machine.sshHost || machine.host || id;
+  const daemonForwardPort =
+    typeof machine.daemonForwardPort === "number" &&
+    Number.isInteger(machine.daemonForwardPort) &&
+    machine.daemonForwardPort > 0 &&
+    machine.daemonForwardPort <= 65535
+      ? machine.daemonForwardPort
+      : parseForwardLocalPort(machine.forward || "");
 
   return {
     id,
     name: machine.name || id,
-    host: local ? "127.0.0.1" : machine.host || machine.sshHost || id,
+    host: local ? "127.0.0.1" : machine.host || sshHost || id,
     kind: local ? "local" : "ssh",
-    sshHost: local ? "" : machine.sshHost || machine.host || id,
-    forward: local ? "" : machine.forward || "",
-    daemonForwardPort: typeof machine.daemonForwardPort === "number" ? machine.daemonForwardPort : null,
+    sshHost,
+    forward: local ? "" : machine.forward || (daemonForwardPort ? buildMachineForward({ sshHost, host: sshHost }, daemonForwardPort) : ""),
+    daemonForwardPort: local ? null : daemonForwardPort,
     paseoInstalled: Boolean(machine.paseoInstalled),
     workspacePath: machine.workspacePath || ""
   };
@@ -235,11 +297,40 @@ function connectionLabel(machine: Machine) {
     return "local";
   }
 
-  if (machine.daemonForwardPort) {
-    return `localhost:${machine.daemonForwardPort} -> 6767`;
+  const forwardPort = getForwardPort(machine);
+
+  if (forwardPort) {
+    return `localhost:${forwardPort} -> ${machine.sshHost || machine.host}:6767`;
   }
 
   return "direct ssh, no forward";
+}
+
+function forwardText(state: ForwardState) {
+  if (state === "starting") return "starting";
+  if (state === "running") return "running";
+  if (state === "retrying") return "retrying";
+  if (state === "stopped") return "stopped";
+  if (state === "error") return "error";
+  return "off";
+}
+
+function retryLabel(status: SshForwardStatus) {
+  if (status.state !== "retrying" || !status.nextRetryAt) {
+    return "";
+  }
+
+  const nextRetry = new Date(status.nextRetryAt);
+
+  if (Number.isNaN(nextRetry.getTime())) {
+    return "";
+  }
+
+  return `retry ${status.retryAttempt || 0} at ${nextRetry.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  })}`;
 }
 
 function daemonText(state: DaemonState) {
@@ -271,6 +362,9 @@ export default function Home() {
   const [formError, setFormError] = useState("");
   const [draft, setDraft] = useState<MachineDraft>(emptyDraft);
   const [daemonStatuses, setDaemonStatuses] = useState<Record<string, DaemonStatus>>({});
+  const [forwardStatuses, setForwardStatuses] = useState<Record<string, SshForwardStatus>>({});
+  const [forwardDraft, setForwardDraft] = useState<ForwardDraft>(emptyForwardDraft);
+  const [forwardMessage, setForwardMessage] = useState("");
 
   const activeMachine = useMemo(() => {
     return config.machines.find((machine) => machine.id === activeMachineId) || config.machines[0] || fallbackMachine;
@@ -299,7 +393,20 @@ export default function Home() {
   }, [config.paseo]);
 
   const activeDaemon = daemonStatuses[activeMachine.id] || { state: "unknown" as DaemonState };
+  const activeForward = forwardStatuses[activeMachine.id] || {
+    state: getForwardPort(activeMachine) ? ("stopped" as ForwardState) : ("off" as ForwardState),
+    command: "",
+    output: "",
+    ok: false,
+    localPort: getForwardPort(activeMachine),
+    remotePort: getForwardPort(activeMachine) ? 6767 : null,
+    target: activeMachine.sshHost || activeMachine.host,
+    managed: "none",
+    retryAttempt: 0,
+    retryDelayMs: null
+  };
   const runningDaemonCount = config.machines.filter((machine) => daemonStatuses[machine.id]?.state === "running").length;
+  const runningForwardCount = config.machines.filter((machine) => forwardStatuses[machine.id]?.state === "running").length;
   const remoteMachineCount = config.machines.filter((machine) => !isLocalMachine(machine)).length;
 
   const statusText = useMemo(() => {
@@ -323,6 +430,7 @@ export default function Home() {
       setConfigPath(data.configPath);
       setActiveMachineId(nextConfig.machines[0]?.id || "localhost");
       setMainView("dashboard");
+      ensureForwardStates(nextConfig.machines);
       refreshDaemonStates(nextConfig.machines);
     }
 
@@ -335,6 +443,42 @@ export default function Home() {
       ignore = true;
     };
   }, []);
+
+  useEffect(() => {
+    const forwardPort = getForwardPort(activeMachine);
+
+    setForwardDraft({
+      enabled: !isLocalMachine(activeMachine) && Boolean(forwardPort),
+      localPort: forwardPort ? String(forwardPort) : ""
+    });
+    setForwardMessage("");
+  }, [activeMachine.id, activeMachine.daemonForwardPort, activeMachine.forward]);
+
+  useEffect(() => {
+    if (mainView !== "machine" || isLocalMachine(activeMachine) || getForwardPort(activeMachine) || forwardDraft.localPort) {
+      return;
+    }
+
+    let ignore = false;
+
+    async function loadForwardPortSuggestion() {
+      const response = await fetch("/api/ports/suggest?start=6767");
+      const data = (await response.json()) as PortSuggestionResponse;
+
+      if (!ignore && data.port) {
+        setForwardDraft((current) => ({
+          ...current,
+          localPort: current.localPort || String(data.port)
+        }));
+      }
+    }
+
+    loadForwardPortSuggestion().catch(() => undefined);
+
+    return () => {
+      ignore = true;
+    };
+  }, [activeMachine, forwardDraft.localPort, mainView]);
 
   useEffect(() => {
     if (!isAddingMachine) {
@@ -374,6 +518,24 @@ export default function Home() {
       ignore = true;
     };
   }, [isAddingMachine]);
+
+  useEffect(() => {
+    const machinesWithForward = config.machines.filter((machine) => !isLocalMachine(machine) && getForwardPort(machine));
+
+    if (machinesWithForward.length === 0) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      machinesWithForward.forEach((machine) => {
+        void requestSshForward(machine, "status");
+      });
+    }, 3000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [config.machines]);
 
   async function refreshDaemonStatus(machine: Machine) {
     setDaemonStatuses((current) => ({
@@ -416,6 +578,84 @@ export default function Home() {
     });
   }
 
+  function setForwardStatus(machine: Machine, status: SshForwardStatus) {
+    setForwardStatuses((current) => ({
+      ...current,
+      [machine.id]: status
+    }));
+  }
+
+  async function requestSshForward(machine: Machine, action: "ensure" | "status" | "stop" | "retry") {
+    if (isLocalMachine(machine) || (!getForwardPort(machine) && action !== "stop")) {
+      const status: SshForwardStatus = {
+        state: "off",
+        command: "",
+        output: isLocalMachine(machine) ? "local machine does not need SSH forward" : "daemon forward is off",
+        ok: true,
+        localPort: null,
+        remotePort: null,
+        target: machine.sshHost || machine.host,
+        managed: "none",
+        retryAttempt: 0,
+        retryDelayMs: null
+      };
+      setForwardStatus(machine, status);
+      return status;
+    }
+
+    if (action === "ensure" || action === "retry") {
+      setForwardStatuses((current) => ({
+        ...current,
+        [machine.id]: {
+          ...(current[machine.id] || {
+            command: "",
+            output: "",
+            ok: false,
+            localPort: getForwardPort(machine),
+            remotePort: 6767,
+            target: machine.sshHost || machine.host,
+            managed: "hub",
+            retryAttempt: action === "retry" ? 0 : current[machine.id]?.retryAttempt || 0,
+            retryDelayMs: action === "retry" ? null : current[machine.id]?.retryDelayMs || null
+          }),
+          state: "starting"
+        }
+      }));
+    }
+
+    try {
+      const response = await fetch("/api/ssh-forward", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, machine })
+      });
+      const data = (await response.json()) as SshForwardStatus;
+      setForwardStatus(machine, data);
+      return data;
+    } catch (error) {
+      const status: SshForwardStatus = {
+        state: "error",
+        command: "",
+        output: error instanceof Error ? error.message : "Failed to manage SSH forward",
+        ok: false,
+        localPort: getForwardPort(machine),
+        remotePort: 6767,
+        target: machine.sshHost || machine.host,
+        managed: "none",
+        retryAttempt: 0,
+        retryDelayMs: null
+      };
+      setForwardStatus(machine, status);
+      return status;
+    }
+  }
+
+  function ensureForwardStates(machines: Machine[]) {
+    machines.forEach((machine) => {
+      void requestSshForward(machine, getForwardPort(machine) ? "ensure" : "status");
+    });
+  }
+
   async function saveConfig(nextConfig: PaseoConfig) {
     const normalized = normalizeConfig(nextConfig);
     setConfig(normalized);
@@ -430,6 +670,7 @@ export default function Home() {
 
     setConfig(savedConfig);
     setConfigPath(data.configPath);
+    ensureForwardStates(savedConfig.machines);
     refreshDaemonStates(savedConfig.machines);
     return savedConfig;
   }
@@ -446,6 +687,7 @@ export default function Home() {
     setPendingMachine(null);
     setActiveMachineId(machine.id);
     setMainView("machine");
+    void requestSshForward(machine, getForwardPort(machine) ? "ensure" : "status");
     void refreshDaemonStatus(machine);
   }
 
@@ -704,6 +946,75 @@ export default function Home() {
     }
   }
 
+  async function saveForwardSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setForwardMessage("");
+
+    if (isLocalMachine(activeMachine)) {
+      setForwardMessage("local machine does not need SSH forward");
+      return;
+    }
+
+    const localPort = forwardDraft.enabled ? Number(forwardDraft.localPort) : null;
+
+    if (forwardDraft.enabled && (!localPort || !Number.isInteger(localPort) || localPort < 1 || localPort > 65535)) {
+      setForwardMessage("forward port must be a valid TCP port");
+      return;
+    }
+
+    const updatedMachine = normalizeMachine({
+      ...activeMachine,
+      forward: forwardDraft.enabled && localPort ? buildMachineForward(activeMachine, localPort) : "",
+      daemonForwardPort: forwardDraft.enabled ? localPort : null
+    });
+    const nextConfig = {
+      ...config,
+      machines: config.machines.map((machine) => (machine.id === updatedMachine.id ? updatedMachine : machine))
+    };
+
+    try {
+      setForwardMessage("saving forward config");
+      const savedConfig = await saveConfig(nextConfig);
+      const savedMachine = savedConfig.machines.find((machine) => machine.id === updatedMachine.id) || updatedMachine;
+
+      setActiveMachineId(savedMachine.id);
+
+      if (forwardDraft.enabled) {
+        const status = await requestSshForward(savedMachine, "ensure");
+        setForwardMessage(status.ok ? "forward running" : "forward failed");
+      } else {
+        await requestSshForward(activeMachine, "stop");
+        setForwardStatus(savedMachine, {
+          state: "off",
+          command: "",
+          output: "daemon forward is off",
+          ok: true,
+          localPort: null,
+          remotePort: null,
+          target: savedMachine.sshHost || savedMachine.host,
+          managed: "none",
+          retryAttempt: 0,
+          retryDelayMs: null
+        });
+        setForwardMessage("forward off");
+      }
+    } catch (error) {
+      setForwardMessage(error instanceof Error ? error.message : "failed to save forward config");
+    }
+  }
+
+  async function retrySshForward(machine = activeMachine) {
+    setForwardMessage("retrying forward");
+    const status = await requestSshForward(machine, "retry");
+    setForwardMessage(status.ok ? "forward running" : status.state === "retrying" ? "retry scheduled" : "forward failed");
+  }
+
+  async function stopForward(machine = activeMachine) {
+    setForwardMessage("stopping forward");
+    const status = await requestSshForward(machine, "stop");
+    setForwardMessage(status.ok ? "forward stopped" : "forward failed");
+  }
+
   const terminalOutput = useMemo(() => {
     if (status === "running") {
       return `${commandPreview}\n${output || `# running ${scriptPath}\n# target ${commandTarget(activeMachine)}`}`;
@@ -887,6 +1198,10 @@ export default function Home() {
                   <strong>{runningDaemonCount}</strong>
                 </div>
                 <div>
+                  <span>ssh forwards</span>
+                  <strong>{runningForwardCount}</strong>
+                </div>
+                <div>
                   <span>ssh targets</span>
                   <strong>{remoteMachineCount}</strong>
                 </div>
@@ -966,6 +1281,74 @@ export default function Home() {
                   <code>{scriptPath}</code>
                 </div>
               </section>
+
+              <form className={styles.forwardPanel} aria-label="SSH forward" onSubmit={saveForwardSettings}>
+                <div className={styles.forwardHead}>
+                  <div>
+                    <p className={styles.panelLabel}>ssh forward</p>
+                    <h2>{forwardText(activeForward.state)}</h2>
+                    <code>{activeForward.command || connectionLabel(activeMachine)}</code>
+                  </div>
+                  <div className={styles.forwardActions}>
+                    <button
+                      type="button"
+                      onClick={() => retrySshForward(activeMachine)}
+                      disabled={isLocalMachine(activeMachine) || !getForwardPort(activeMachine) || activeForward.state === "starting"}
+                    >
+                      Retry
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => stopForward(activeMachine)}
+                      disabled={isLocalMachine(activeMachine) || activeForward.state === "off" || activeForward.state === "starting"}
+                    >
+                      Stop
+                    </button>
+                    <button type="submit" disabled={isLocalMachine(activeMachine)}>
+                      Save
+                    </button>
+                  </div>
+                </div>
+
+                <div className={styles.forwardFields}>
+                  <label className={styles.checkboxLine}>
+                    <input
+                      checked={forwardDraft.enabled}
+                      disabled={isLocalMachine(activeMachine)}
+                      name="forwardEnabled"
+                      type="checkbox"
+                      onChange={(event) =>
+                        setForwardDraft((current) => ({
+                          ...current,
+                          enabled: event.target.checked,
+                          localPort: current.localPort || (portSuggestion ? String(portSuggestion) : "6768")
+                        }))
+                      }
+                    />
+                    Auto forward daemon
+                  </label>
+                  <label>
+                    Local port
+                    <input
+                      disabled={isLocalMachine(activeMachine) || !forwardDraft.enabled}
+                      inputMode="numeric"
+                      name="forwardLocalPort"
+                      placeholder={portSuggestion ? String(portSuggestion) : "6768"}
+                      value={forwardDraft.localPort}
+                      onChange={(event) => setForwardDraft((current) => ({ ...current, localPort: event.target.value }))}
+                    />
+                  </label>
+                </div>
+
+                {(forwardMessage || retryLabel(activeForward)) && (
+                  <p className={styles.forwardMessage}>{forwardMessage || retryLabel(activeForward)}</p>
+                )}
+                {activeForward.output && (
+                  <pre className={styles.forwardOutput}>
+                    <code>{activeForward.output}</code>
+                  </pre>
+                )}
+              </form>
 
               <section className={styles.daemonPanel} aria-label="Paseo daemon">
                 <div>

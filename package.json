@@ -8,7 +8,13 @@
     "dev": "next dev --webpack",
     "build": "next build --webpack",
     "start": "next start",
-    "install:paseo": "node server-side/paseo/install.ts"
+    "install:paseo": "node server-side/paseo/install.ts",
+    "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-service.ps1 install",
+    "service:uninstall": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-service.ps1 uninstall",
+    "service:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-service.ps1 start",
+    "service:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-service.ps1 stop",
+    "service:restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-service.ps1 restart",
+    "service:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-service.ps1 status"
   },
   "dependencies": {
     "next": "^16.2.6",

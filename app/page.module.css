@@ -452,7 +452,7 @@
 
 .stateRail {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-bottom: 18px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -633,6 +633,23 @@
   background: var(--panel);
 }
 
+.forwardPanel {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 14px;
+  padding: 17px 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.forwardHead {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: start;
+}
+
 .daemonPanel h2 {
   margin: 0 0 7px;
   color: var(--text);
@@ -641,7 +658,16 @@
   line-height: 1.15;
 }
 
-.daemonPanel code {
+.forwardPanel h2 {
+  margin: 0 0 7px;
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.daemonPanel code,
+.forwardPanel code {
   display: block;
   overflow: hidden;
   color: var(--muted);
@@ -651,10 +677,91 @@
   white-space: nowrap;
 }
 
-.daemonActions {
+.daemonActions,
+.forwardActions {
   display: inline-flex;
   align-items: start;
   gap: 8px;
+}
+
+.forwardActions button {
+  height: 32px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 650;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    transform 160ms ease;
+}
+
+.forwardActions button:hover {
+  border-color: rgba(88, 153, 232, 0.62);
+  background: var(--selected);
+}
+
+.forwardActions button:active {
+  transform: translateY(1px);
+}
+
+.forwardActions button:last-child {
+  border-color: rgba(88, 153, 232, 0.56);
+  background: rgba(88, 153, 232, 0.12);
+}
+
+.forwardActions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.forwardFields {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(180px, 1fr);
+  gap: 12px;
+  align-items: end;
+}
+
+.forwardFields label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.forwardFields input {
+  min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--input);
+  color: var(--text);
+  outline: none;
+  font-size: 13px;
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease;
+}
+
+.forwardFields input:focus {
+  border-color: var(--accent);
+}
+
+.forwardFields input:disabled {
+  color: var(--dim);
+}
+
+.forwardMessage {
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
 }
 
 .daemonOutput {
@@ -668,7 +775,18 @@
   background: var(--code);
 }
 
-.daemonOutput code {
+.forwardOutput {
+  max-height: 140px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: var(--code);
+}
+
+.daemonOutput code,
+.forwardOutput code {
   color: var(--muted);
   font-family: var(--mono);
   font-size: 12px;
@@ -914,7 +1032,9 @@
   }
 
   .detailGrid,
-  .daemonPanel {
+  .daemonPanel,
+  .forwardHead,
+  .forwardFields {
     grid-template-columns: 1fr;
   }
 
@@ -932,8 +1052,13 @@
     width: 100%;
   }
 
-  .daemonActions button {
+  .daemonActions button,
+  .forwardActions button {
     flex: 1;
+  }
+
+  .forwardActions {
+    width: 100%;
   }
 
   .runnerHeader {

@@ -11,6 +11,7 @@ import {
 import { exists, remotePaseoBin } from "./cli.ts";
 import { resolveProxyEnv } from "./proxy.ts";
 import { readPaseoHubConfig } from "./config.mjs";
+import { applyLocalPaseoSourcePatches } from "./source-patches.ts";
 
 type Machine = MachineTarget & {
   id: string;
@@ -64,6 +65,24 @@ const buildCommand = [
   "pnpm --filter @getpaseo/server build",
   "pnpm --filter @getpaseo/cli build"
 ].join(" && ");
+const trustedPnpmBuildPackages = [
+  "@google/genai",
+  "esbuild",
+  "koffi",
+  "lefthook",
+  "node-pty",
+  "onnxruntime-node",
+  "protobufjs"
+];
+const ignoredPnpmBuildPackages = [
+  "core-js",
+  "dtrace-provider",
+  "electron",
+  "electron-winstaller",
+  "sharp",
+  "unrs-resolver",
+  "workerd"
+];
 const transcript: string[] = [];
 
 function record(stream: NodeJS.WriteStream, text: string) {
@@ -324,6 +343,17 @@ function getPackageWorkspaces(pkg: { workspaces?: string[] | { packages?: string
   return [];
 }
 
+function pnpmWorkspaceYaml(workspaces: string[]) {
+  return [
+    "packages:",
+    ...workspaces.map((item) => `  - ${JSON.stringify(item)}`),
+    "",
+    "allowBuilds:",
+    ...trustedPnpmBuildPackages.map((name) => `  ${JSON.stringify(name)}: true`),
+    ...ignoredPnpmBuildPackages.map((name) => `  ${JSON.stringify(name)}: false`)
+  ].join("\n") + "\n";
+}
+
 async function ensureLocalPnpmWorkspace(workspace: string) {
   const packageJsonPath = path.join(workspace, "package.json");
   const pkg = JSON.parse(await readFile(packageJsonPath, "utf8")) as {
@@ -336,12 +366,10 @@ async function ensureLocalPnpmWorkspace(workspace: string) {
   }
 
   const workspaceFile = path.join(workspace, "pnpm-workspace.yaml");
-  await writeFile(
-    workspaceFile,
-    `packages:\n${workspaces.map((item) => `  - ${JSON.stringify(item)}`).join("\n")}\n`,
-    "utf8"
-  );
+  await writeFile(workspaceFile, pnpmWorkspaceYaml(workspaces), "utf8");
   logLine(`workspace-file: ${workspaceFile}`);
+  logLine(`trusted-builds: ${trustedPnpmBuildPackages.join(", ")}`);
+  logLine(`ignored-builds: ${ignoredPnpmBuildPackages.join(", ")}`);
 }
 
 async function ensureRemotePnpmWorkspace(workspace: string) {
@@ -349,7 +377,9 @@ async function ensureRemotePnpmWorkspace(workspace: string) {
     "const fs=require('node:fs')",
     "const pkg=JSON.parse(fs.readFileSync('package.json','utf8'))",
     "const ws=Array.isArray(pkg.workspaces)?pkg.workspaces:((pkg.workspaces&&Array.isArray(pkg.workspaces.packages))?pkg.workspaces.packages:[])",
-    "if(ws.length){fs.writeFileSync('pnpm-workspace.yaml','packages:\\n'+ws.map((item)=>'  - '+JSON.stringify(item)).join('\\n')+'\\n');console.log('wrote pnpm-workspace.yaml ('+ws.length+' packages)')}"
+    `const trusted=${JSON.stringify(trustedPnpmBuildPackages)}`,
+    `const ignored=${JSON.stringify(ignoredPnpmBuildPackages)}`,
+    "if(ws.length){const lines=['packages:',...ws.map((item)=>'  - '+JSON.stringify(item)),'','allowBuilds:',...trusted.map((name)=>'  '+JSON.stringify(name)+': true'),...ignored.map((name)=>'  '+JSON.stringify(name)+': false')];fs.writeFileSync('pnpm-workspace.yaml',lines.join('\\n')+'\\n');console.log('wrote pnpm-workspace.yaml ('+ws.length+' packages, '+trusted.length+' trusted builds, '+ignored.length+' ignored builds)')}"
   ].join(";");
 
   await runStep("write pnpm workspace file", `node -e ${quotePosix(script)}`, {
@@ -583,6 +613,16 @@ async function main() {
 
   const sourceWorkspace =
     config.paseo.source === "github" ? await prepareGithubSource() : await prepareNpmWorkspace();
+
+  if (config.paseo.source === "github" && isLocalMachine(machine)) {
+    const patchedFiles = await applyLocalPaseoSourcePatches(sourceWorkspace);
+
+    for (const patchedFile of patchedFiles) {
+      logLine(
+        `${patchedFile.changed ? "patched" : "patch-current"}: ${path.relative(root, patchedFile.filePath)}`
+      );
+    }
+  }
 
   const installResult =
     config.paseo.source === "github"

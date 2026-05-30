@@ -1,8 +1,9 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { isLocalMachine, runLocalExecutableCommand, runMachineCommand, type MachineTarget } from "./command.ts";
 import {
   buildPaseoCommand,
@@ -11,6 +12,7 @@ import {
   quoteLocalPath,
   resolveLocalPaseoInvocation
 } from "./cli.ts";
+import { applyLocalPaseoSourcePatches } from "./source-patches.ts";
 
 export type DaemonState = "unknown" | "running" | "stopped" | "missing" | "error";
 
@@ -39,7 +41,54 @@ type InstallationState = {
 const defaultListen = "127.0.0.1:6767";
 const restartWaitMs = 6000;
 const restartPollMs = 250;
-let localManagedDaemonChild: ChildProcess | null = null;
+
+type PaseoListenTarget =
+  | {
+      type: "tcp";
+      host: string;
+      port: number;
+    }
+  | {
+      type: "socket" | "pipe";
+      path: string;
+    };
+
+type PaseoDaemon = {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  getListenTarget(): PaseoListenTarget | null;
+};
+
+type PaseoDaemonConfig = Record<string, unknown> & {
+  listen?: string;
+  log?: unknown;
+  onLifecycleIntent?: (intent: { type: "shutdown" | "restart"; reason?: string }) => void;
+  staticDir?: string;
+};
+
+type PaseoBootstrapModule = {
+  createPaseoDaemon(config: PaseoDaemonConfig, rootLogger: unknown): Promise<PaseoDaemon>;
+};
+
+type PaseoConfigModule = {
+  loadConfig(paseoHome: string, options?: { env?: NodeJS.ProcessEnv }): PaseoDaemonConfig;
+};
+
+type PaseoLoggerModule = {
+  createRootLogger(configInput: unknown, options?: { paseoHome?: string; file?: boolean }): unknown;
+};
+
+type LocalManagedDaemonState = {
+  daemon: PaseoDaemon;
+  listen: string;
+  startedAt: string;
+  workspace: string;
+};
+
+type GlobalWithLocalDaemon = typeof globalThis & {
+  __paseoHubLocalDaemon?: LocalManagedDaemonState;
+  __paseoHubLocalDaemonExitHooks?: boolean;
+};
 
 function classifyDaemonOutput(output: string, ok: boolean): DaemonState {
   const localDaemon = readStatusRow(output, "Local Daemon");
@@ -105,6 +154,25 @@ function sleep(ms: number) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function globalDaemonState() {
+  return globalThis as GlobalWithLocalDaemon;
+}
+
+function getLocalManagedDaemonState() {
+  return globalDaemonState().__paseoHubLocalDaemon ?? null;
+}
+
+function setLocalManagedDaemonState(state: LocalManagedDaemonState | null) {
+  const globalState = globalDaemonState();
+
+  if (state) {
+    globalState.__paseoHubLocalDaemon = state;
+    return;
+  }
+
+  delete globalState.__paseoHubLocalDaemon;
 }
 
 async function readJsonFile<T>(filePath: string): Promise<T | null> {
@@ -179,14 +247,16 @@ async function getLocalBackendDaemonStatus(): Promise<DaemonCommandResult> {
     readJsonFile<LocalPidInfo>(pidPath),
     readJsonFile<LocalPaseoConfig>(configPath)
   ]);
-  const pid = typeof pidInfo?.pid === "number" && Number.isInteger(pidInfo.pid) ? pidInfo.pid : null;
-  const listen = normalizeListen(pidInfo?.listen || config?.listen);
-  const processRunning = pid !== null && isProcessRunning(pid);
+  const managed = getLocalManagedDaemonState();
+  const pidFromFile = typeof pidInfo?.pid === "number" && Number.isInteger(pidInfo.pid) ? pidInfo.pid : null;
+  const pid = managed ? process.pid : pidFromFile;
+  const listen = normalizeListen(pidInfo?.listen || managed?.listen || config?.listen);
+  const processRunning = managed !== null || (pid !== null && isProcessRunning(pid));
   const reachable = await canConnectToListen(listen);
   const localDaemon = processRunning ? "running" : pid ? "stale_pid" : "stopped";
   const connectedDaemon = reachable === null ? "not_probed" : reachable ? "reachable" : "unreachable";
   const state: DaemonState = processRunning || reachable ? "running" : "stopped";
-  const startedAt = typeof pidInfo?.startedAt === "string" ? pidInfo.startedAt : "-";
+  const startedAt = typeof pidInfo?.startedAt === "string" ? pidInfo.startedAt : managed?.startedAt || "-";
   const hostname = typeof pidInfo?.hostname === "string" ? pidInfo.hostname : os.hostname();
 
   return {
@@ -201,49 +271,17 @@ async function getLocalBackendDaemonStatus(): Promise<DaemonCommandResult> {
       `Hostname          ${hostname}`,
       `PID               ${pid ?? "-"}`,
       `Started           ${startedAt}`,
+      `Managed           ${managed ? "backend_process" : "pid_file"}`,
       `Logs              ${logPath}`
     ].join("\n"),
     ok: true
   };
 }
 
-function killProcessTree(child: ChildProcess) {
-  if (!child.pid) {
-    child.kill();
-    return;
-  }
-
-  if (process.platform !== "win32") {
-    child.kill("SIGTERM");
-    return;
-  }
-
-  const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
-    stdio: "ignore",
-    windowsHide: true
-  });
-
-  killer.on("error", () => {
-    child.kill();
-  });
-}
-
-async function stopLocalBackendDaemon() {
-  const pidInfo = await readJsonFile<LocalPidInfo>(path.join(localPaseoHome(), "paseo.pid"));
-  const pid = typeof pidInfo?.pid === "number" && Number.isInteger(pidInfo.pid) ? pidInfo.pid : null;
-
-  if (localManagedDaemonChild && (!pid || localManagedDaemonChild.pid === pid)) {
-    killProcessTree(localManagedDaemonChild);
-    localManagedDaemonChild = null;
-  }
-
-  if (!pid || !isProcessRunning(pid)) {
-    return { pid, stopped: false };
-  }
-
+async function killPidTree(pid: number) {
   if (process.platform !== "win32") {
     process.kill(pid, "SIGTERM");
-    return { pid, stopped: true };
+    return;
   }
 
   await new Promise<void>((resolve) => {
@@ -262,13 +300,45 @@ async function stopLocalBackendDaemon() {
       resolve();
     });
   });
+}
+
+async function removeLocalPidFile() {
+  await rm(path.join(localPaseoHome(), "paseo.pid"), { force: true });
+}
+
+async function stopLocalBackendDaemon() {
+  const managed = getLocalManagedDaemonState();
+
+  if (managed) {
+    setLocalManagedDaemonState(null);
+    await managed.daemon.stop();
+    await removeLocalPidFile();
+    return { pid: process.pid, stopped: true };
+  }
+
+  const pidInfo = await readJsonFile<LocalPidInfo>(path.join(localPaseoHome(), "paseo.pid"));
+  const pid = typeof pidInfo?.pid === "number" && Number.isInteger(pidInfo.pid) ? pidInfo.pid : null;
+
+  if (!pid || !isProcessRunning(pid)) {
+    if (pid) {
+      await removeLocalPidFile();
+    }
+    return { pid, stopped: false };
+  }
+
+  if (pid === process.pid) {
+    return { pid, stopped: false };
+  }
+
+  await killPidTree(pid);
+  await removeLocalPidFile();
 
   return { pid, stopped: true };
 }
 
-async function writeLocalPidFile(pid: number | null, listen: string) {
+async function writeLocalPidFile(pid: number, listen: string, startedAt: string) {
   if (!pid) {
-    throw new Error("Paseo daemon worker did not expose a PID");
+    throw new Error("Paseo backend process did not expose a PID");
   }
 
   const home = localPaseoHome();
@@ -277,11 +347,12 @@ async function writeLocalPidFile(pid: number | null, listen: string) {
     path.join(home, "paseo.pid"),
     JSON.stringify({
       pid,
-      startedAt: new Date().toISOString(),
+      startedAt,
       hostname: os.hostname(),
       uid: process.getuid?.() ?? 0,
       listen,
-      backendManaged: true
+      backendManaged: true,
+      backendMode: "in-process"
     }),
     "utf8"
   );
@@ -294,31 +365,116 @@ async function resolveLocalPaseoWorkspace(root: string) {
   return workspace || fallback;
 }
 
-async function resolveLocalDaemonWorkerEntry(root: string) {
+async function resolveLocalDaemonServerDir(root: string) {
   const workspace = await resolveLocalPaseoWorkspace(root);
-  const candidates = [
-    path.join(workspace, "packages", "server", "dist", "server", "server", "daemon-worker.js"),
-    path.join(workspace, "packages", "server", "src", "server", "daemon-worker.ts")
-  ];
+  const serverDir = path.join(workspace, "packages", "server", "dist", "server", "server");
 
-  for (const candidate of candidates) {
-    if (await exists(candidate)) {
-      return { workspace, entry: candidate };
-    }
+  if (await exists(path.join(serverDir, "bootstrap.js"))) {
+    return { workspace, serverDir };
   }
 
-  throw new Error(`Paseo daemon worker entry not found under ${workspace}`);
+  throw new Error(`Built Paseo daemon server files not found under ${workspace}. Run pnpm install:paseo first.`);
 }
 
-function startHiddenLocalWorker(workspace: string, entry: string) {
-  const execArgv = entry.endsWith(".ts") ? ["--import", "tsx"] : [];
+async function importLocalDaemonModules(serverDir: string) {
+  const [bootstrap, config, logger] = await Promise.all([
+    import(/* webpackIgnore: true */ pathToFileURL(path.join(serverDir, "bootstrap.js")).href) as Promise<PaseoBootstrapModule>,
+    import(/* webpackIgnore: true */ pathToFileURL(path.join(serverDir, "config.js")).href) as Promise<PaseoConfigModule>,
+    import(/* webpackIgnore: true */ pathToFileURL(path.join(serverDir, "logger.js")).href) as Promise<PaseoLoggerModule>
+  ]);
 
-  return spawn(process.execPath, [...execArgv, entry], {
-    cwd: workspace,
-    env: process.env,
-    stdio: ["ignore", "ignore", "ignore", "ipc"],
-    windowsHide: true
+  return { bootstrap, config, logger };
+}
+
+function formatPaseoListenTarget(listenTarget: PaseoListenTarget | null) {
+  if (!listenTarget) {
+    return "";
+  }
+
+  if (listenTarget.type === "tcp") {
+    return `${listenTarget.host}:${listenTarget.port}`;
+  }
+
+  return listenTarget.path;
+}
+
+function daemonLogConfig(configLog: unknown) {
+  const base = typeof configLog === "object" && configLog !== null ? (configLog as Record<string, unknown>) : {};
+
+  return {
+    log: {
+      ...base,
+      file:
+        typeof base.file === "object" && base.file !== null
+          ? base.file
+          : {
+              level: "info",
+              path: "daemon.log"
+            }
+    }
+  };
+}
+
+function installLocalDaemonExitHooks() {
+  const globalState = globalDaemonState();
+
+  if (globalState.__paseoHubLocalDaemonExitHooks) {
+    return;
+  }
+
+  globalState.__paseoHubLocalDaemonExitHooks = true;
+
+  const stop = () => {
+    const managed = getLocalManagedDaemonState();
+
+    if (!managed) {
+      return;
+    }
+
+    setLocalManagedDaemonState(null);
+    void managed.daemon.stop().catch(() => undefined);
+  };
+
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  process.once("exit", () => {
+    setLocalManagedDaemonState(null);
   });
+}
+
+async function startLocalInProcessDaemon(workspace: string, serverDir: string) {
+  const modules = await importLocalDaemonModules(serverDir);
+  const paseoHome = localPaseoHome();
+  const config = modules.config.loadConfig(paseoHome, {
+    env: {
+      ...process.env,
+      PASEO_HOME: paseoHome
+    }
+  });
+
+  config.staticDir = path.join(workspace, "public");
+  config.onLifecycleIntent = (intent) => {
+    if (intent.type === "shutdown") {
+      void stopLocalBackendDaemon().catch(() => undefined);
+      return;
+    }
+
+    void restartLocalBackendDaemon().catch(() => undefined);
+  };
+
+  const logger = modules.logger.createRootLogger(daemonLogConfig(config.log), { paseoHome });
+  const daemon = await modules.bootstrap.createPaseoDaemon(config, logger);
+
+  await daemon.start();
+
+  const listen = normalizeListen(formatPaseoListenTarget(daemon.getListenTarget()) || config.listen);
+  const startedAt = new Date().toISOString();
+
+  setLocalManagedDaemonState({ daemon, listen, startedAt, workspace });
+  installLocalDaemonExitHooks();
+  await writeLocalPidFile(process.pid, listen, startedAt);
+
+  return { listen, startedAt };
 }
 
 async function waitForLocalDaemonState() {
@@ -340,57 +496,9 @@ async function waitForLocalDaemonState() {
 async function restartLocalBackendDaemon(): Promise<DaemonCommandResult> {
   const root = process.cwd();
   const stopped = await stopLocalBackendDaemon();
-  const { workspace, entry } = await resolveLocalDaemonWorkerEntry(root);
-  const child = startHiddenLocalWorker(workspace, entry);
-
-  const startup = await new Promise<{ ok: true; listen: string } | { ok: false; message: string }>((resolve) => {
-    const timer = setTimeout(() => resolve({ ok: false, message: "Paseo daemon worker did not report ready in time" }), 8000);
-
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      resolve({ ok: false, message: error.message });
-    });
-
-    child.once("exit", (code, signal) => {
-      clearTimeout(timer);
-      resolve({
-        ok: false,
-        message: `Paseo daemon worker exited early with ${signal || `code ${code ?? "unknown"}`}`
-      });
-    });
-
-    child.on("message", (message: unknown) => {
-      if (
-        typeof message === "object" &&
-        message !== null &&
-        "type" in message &&
-        message.type === "paseo:ready" &&
-        "listen" in message &&
-        typeof message.listen === "string"
-      ) {
-        clearTimeout(timer);
-        resolve({ ok: true, listen: message.listen });
-      }
-    });
-  });
-
-  if (!startup.ok) {
-    killProcessTree(child);
-    return {
-      state: "error",
-      command: "backend daemon restart",
-      output: startup.message,
-      ok: false
-    };
-  }
-
-  await writeLocalPidFile(child.pid ?? null, startup.listen);
-  localManagedDaemonChild = child;
-  child.once("close", () => {
-    if (localManagedDaemonChild === child) {
-      localManagedDaemonChild = null;
-    }
-  });
+  const { workspace, serverDir } = await resolveLocalDaemonServerDir(root);
+  await applyLocalPaseoSourcePatches(workspace);
+  const started = await startLocalInProcessDaemon(workspace, serverDir);
 
   const status = await waitForLocalDaemonState();
   const transition = stopped.pid
@@ -402,7 +510,12 @@ async function restartLocalBackendDaemon(): Promise<DaemonCommandResult> {
   return {
     state: status.state,
     command: "backend daemon restart",
-    output: [`${transition}`, `started daemon PID ${child.pid ?? "unknown"}`, status.output].join("\n"),
+    output: [
+      `${transition}`,
+      `started daemon in backend PID ${process.pid}`,
+      `listen ${started.listen}`,
+      status.output
+    ].join("\n"),
     ok: status.state === "running"
   };
 }

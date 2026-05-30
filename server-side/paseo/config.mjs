@@ -43,6 +43,19 @@ export function getConfigPath() {
   return path.join(getConfigDir(), "config.json");
 }
 
+function parseForwardLocalPort(forward) {
+  if (typeof forward !== "string" || !forward.trim()) {
+    return null;
+  }
+
+  const readableMatch = forward.match(/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*(\d+)/iu);
+  const arrowMatch = forward.match(/:(\d+)\s*->/u);
+  const sshDashLMatch = forward.match(/(?:^|\s)(\d+):[^:\s]+:\d+(?:\s|$)/u);
+  const parsed = Number(readableMatch?.[1] || arrowMatch?.[1] || sshDashLMatch?.[1]);
+
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : null;
+}
+
 function normalizeMachine(machine) {
   const id = machine.id || machine.name || "machine";
   const isLocal =
@@ -50,18 +63,23 @@ function normalizeMachine(machine) {
     id === "localhost" ||
     machine.name === "localhost" ||
     (!machine.sshHost && (machine.host === "localhost" || machine.host === "127.0.0.1"));
+  const sshHost = isLocal ? "" : machine.sshHost || machine.host || id;
+  const daemonForwardPort =
+    typeof machine.daemonForwardPort === "number" &&
+    Number.isInteger(machine.daemonForwardPort) &&
+    machine.daemonForwardPort > 0 &&
+    machine.daemonForwardPort <= 65535
+      ? machine.daemonForwardPort
+      : parseForwardLocalPort(machine.forward);
 
   return {
     id,
     name: machine.name || id,
-    host: isLocal ? "127.0.0.1" : machine.host || machine.sshHost || id,
+    host: isLocal ? "127.0.0.1" : machine.host || sshHost || id,
     kind: isLocal ? "local" : "ssh",
-    sshHost: isLocal ? "" : machine.sshHost || machine.host || id,
-    forward: isLocal ? "" : machine.forward || "",
-    daemonForwardPort:
-      typeof machine.daemonForwardPort === "number" && Number.isFinite(machine.daemonForwardPort)
-        ? machine.daemonForwardPort
-        : null,
+    sshHost,
+    forward: isLocal ? "" : machine.forward || (daemonForwardPort ? `localhost:${daemonForwardPort}->${sshHost}:6767` : ""),
+    daemonForwardPort: isLocal ? null : daemonForwardPort,
     paseoInstalled: Boolean(machine.paseoInstalled),
     workspacePath: machine.workspacePath || ""
   };

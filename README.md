@@ -26,7 +26,7 @@ pnpm build
 pnpm start
 ```
 
-On Windows, Paseo Hub also includes service helpers:
+On Windows, Paseo Hub also includes startup helpers. They install a Task Scheduler entry that starts Paseo Hub when the current Windows user logs in, so `paseo`, `ssh`, and `pnpm` run under the same user profile:
 
 ```sh
 pnpm service:install
@@ -34,7 +34,7 @@ pnpm service:start
 pnpm service:status
 ```
 
-`pnpm service:install` configures the service to run as the current Windows user by default. To use a different administrator account, run `pnpm service:install -- -PromptServiceAccount` from an elevated PowerShell session and enter that account when prompted. To intentionally run as the built-in system account, use `pnpm service:install -- -RunAsLocalSystem`.
+`pnpm service:install` no longer creates a Windows Service or asks for a service account password. If an older `PaseoHub` Windows Service exists, disable or delete it from an elevated PowerShell session with `sc.exe stop PaseoHub` and `sc.exe delete PaseoHub`.
 
 ## Configuration
 

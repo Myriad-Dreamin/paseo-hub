@@ -342,6 +342,22 @@ function daemonText(state: DaemonState) {
   return "unknown";
 }
 
+async function readJsonResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+
+  if (!text.trim()) {
+    throw new Error(`Empty response from ${response.url || "request"} (${response.status})`);
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    const contentType = response.headers.get("content-type") || "unknown content type";
+    const excerpt = text.replace(/\s+/g, " ").trim().slice(0, 240);
+    throw new Error(`Expected JSON from ${response.url || "request"} (${response.status}, ${contentType}). ${excerpt}`);
+  }
+}
+
 function installState(machine: Machine) {
   return machine.paseoInstalled ? "installed" : "missing";
 }
@@ -552,7 +568,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ machine })
       });
-      const data = (await response.json()) as DaemonStatus;
+      const data = await readJsonResponse<DaemonStatus>(response);
 
       setDaemonStatuses((current) => ({
         ...current,
@@ -833,13 +849,13 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ machine })
       });
-      const data = (await response.json()) as DaemonStatus;
+      const data = await readJsonResponse<DaemonStatus>(response);
 
       setDaemonStatuses((current) => ({
         ...current,
         [machine.id]: {
           ...data,
-          state: data.state || (response.ok ? "running" : "error")
+          state: data.state || (data.ok === false || !response.ok ? "error" : "running")
         }
       }));
 

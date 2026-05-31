@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   isLocalMachine,
@@ -442,58 +442,71 @@ async function ensureRemotePrerequisites() {
   });
 }
 
-async function linkLocalPaseoCli(workspace: string) {
-  const wrapperPath = path.join(binDir, process.platform === "win32" ? "paseo.cmd" : "paseo");
-
-  if (config.paseo.source === "github") {
-    const cliEntry = path.join(workspace, "packages", "cli", "bin", "paseo");
-
-    if (process.platform === "win32") {
-      const script = `@echo off\r\ncd /d "${workspace}"\r\nnode --disable-warning=DEP0040 "${cliEntry}" %*\r\n`;
-      await writeFile(wrapperPath, script, "utf8");
-      return wrapperPath;
-    }
-
-    const script = `#!/usr/bin/env sh\ncd "${workspace}"\nexec node --disable-warning=DEP0040 "${cliEntry}" "$@"\n`;
-    await writeFile(wrapperPath, script, "utf8");
-    await chmod(wrapperPath, 0o755);
-    return wrapperPath;
-  }
-
-  const directBin = path.join(workspace, "node_modules", ".bin", process.platform === "win32" ? "paseo.cmd" : "paseo");
-
-  if (process.platform === "win32") {
-    const target = (await exists(directBin)) ? directBin : "";
-    const script = target
-      ? `@echo off\r\ncall "${target}" %*\r\n`
-      : `@echo off\r\ncd /d "${workspace}"\r\npnpm exec paseo %*\r\n`;
-    await writeFile(wrapperPath, script, "utf8");
-    return wrapperPath;
-  }
-
-  const target = (await exists(directBin)) ? directBin : "";
-  const script = target
-    ? `#!/usr/bin/env sh\nexec "${target}" "$@"\n`
-    : `#!/usr/bin/env sh\ncd "${workspace}"\nexec pnpm exec paseo "$@"\n`;
-  await writeFile(wrapperPath, script, "utf8");
-  await chmod(wrapperPath, 0o755);
-  return wrapperPath;
+function nodeModulesPackagePath(workspace: string, packageName: string) {
+  return path.join(workspace, "node_modules", ...packageName.split("/"));
 }
 
-async function linkRemotePaseoCli(workspace: string) {
-  const workspacePath = quoteRemotePath(workspace);
-  const cliLines =
+function localCliLinkWorkspace(workspace: string) {
+  return config.paseo.source === "github"
+    ? path.join(workspace, "packages", "cli")
+    : nodeModulesPackagePath(workspace, config.paseo.packageName);
+}
+
+function remoteCliLinkWorkspace(workspace: string) {
+  const suffix =
     config.paseo.source === "github"
-      ? [
-          "#!/usr/bin/env sh",
-          `cd ${workspacePath}`,
-          'exec node --disable-warning=DEP0040 packages/cli/bin/paseo "$@"'
-        ]
-      : ["#!/usr/bin/env sh", `cd ${workspacePath}`, 'exec pnpm exec paseo "$@"'];
+      ? "packages/cli"
+      : `node_modules/${config.paseo.packageName}`;
+
+  return `${workspace.replace(/\/$/u, "")}/${suffix}`;
+}
+
+function localLinkedCliPath() {
+  return path.join(binDir, process.platform === "win32" ? "paseo.cmd" : "paseo");
+}
+
+function localPnpmLinkCommand(linkWorkspace: string) {
+  const pnpmHome = path.join(stateDir, "pnpm");
+
+  if (process.platform === "win32") {
+    return [
+      `set "PNPM_HOME=${pnpmHome}"`,
+      `set "PATH=${binDir};%PATH%"`,
+      `pnpm link --global ${quoteLocalArg(linkWorkspace)} --config.global-bin-dir=${quoteLocalArg(binDir)}`
+    ].join(" && ");
+  }
+
+  return [
+    `export PNPM_HOME=${quotePosix(pnpmHome)}`,
+    `export PATH=${quotePosix(binDir)}":$PATH"`,
+    `pnpm link --global ${quotePosix(linkWorkspace)} --config.global-bin-dir=${quotePosix(binDir)}`
+  ].join(" && ");
+}
+
+async function linkLocalPaseoCli(workspace: string): Promise<LinkedCli> {
+  const linkWorkspace = localCliLinkWorkspace(workspace);
+  const result = await runStep("link Paseo CLI", localPnpmLinkCommand(linkWorkspace), {
+    cwd: root,
+    timeoutMs: 60000,
+    forwardProxyEnv: false
+  });
+
+  return {
+    path: localLinkedCliPath(),
+    output: [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n")
+  };
+}
+
+async function linkRemotePaseoCli(workspace: string): Promise<LinkedCli> {
+  const linkWorkspace = quoteRemotePath(remoteCliLinkWorkspace(workspace));
   const command = [
-    'mkdir -p "$HOME/.paseo-hub/bin"',
-    `printf '%s\\n' ${cliLines.map(quotePosix).join(" ")} > ${quoteRemotePath(remoteBin)}`,
-    `chmod +x ${quoteRemotePath(remoteBin)}`
+    'export PASEO_HUB_BIN="$HOME/.paseo-hub/bin"',
+    'export PNPM_HOME="$HOME/.paseo-hub/pnpm"',
+    'mkdir -p "$PASEO_HUB_BIN" "$PNPM_HOME"',
+    'export PATH="$PASEO_HUB_BIN:$PATH"',
+    'PASEO_PNPM_LINK_YES=""',
+    'if pnpm help link | grep -q -- "--yes"; then PASEO_PNPM_LINK_YES="--yes"; fi',
+    `pnpm link --global ${linkWorkspace} $PASEO_PNPM_LINK_YES --config.global-bin-dir="$PASEO_HUB_BIN"`
   ].join(" && ");
 
   const result = await runStep("link Paseo CLI", command, {
@@ -510,10 +523,7 @@ async function linkRemotePaseoCli(workspace: string) {
 
 async function linkPaseoCli(workspace: string): Promise<LinkedCli> {
   if (isLocalMachine(machine)) {
-    return {
-      path: await linkLocalPaseoCli(workspace),
-      output: ""
-    };
+    return linkLocalPaseoCli(workspace);
   }
 
   return linkRemotePaseoCli(workspace);
